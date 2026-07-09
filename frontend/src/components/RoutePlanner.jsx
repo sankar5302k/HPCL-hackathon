@@ -15,7 +15,7 @@ import {
   X
 } from 'lucide-react';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
+const API_BASE_URL = 'https://hpcl-hackathon-1.onrender.com/api';
 
 // Haversine Distance helper for frontend route construction
 function haversineDistance(lat1, lon1, lat2, lon2) {
