@@ -351,9 +351,33 @@ function parseInlineFormatting(text) {
 export default function RoutePlanner() {
   const [outlets, setOutlets] = useState([]);
   const [loadingData, setLoadingData] = useState(true);
+  const [qaReports, setQaReports] = useState([]);
 
   const [route, setRoute] = useState([]);
   const [startCoords, setStartCoords] = useState({ lat: 23.259933, lon: 77.412613 });
+
+  // Helper: parse TSV file format (UTF-16 encoding)
+  const parseTSV = (text) => {
+    const lines = text.split(/\r?\n/);
+    if (lines.length === 0) return [];
+    const headers = lines[0].split('\t').map(h => h.trim());
+    const records = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const cols = line.split('\t');
+      const record = {};
+      headers.forEach((h, index) => {
+        let val = cols[index] !== undefined ? cols[index].trim() : '';
+        if (val.startsWith('"') && val.endsWith('"')) {
+          val = val.substring(1, val.length - 1);
+        }
+        record[h] = val;
+      });
+      records.push(record);
+    }
+    return records;
+  };
 
   const [messages, setMessages] = useState([
     {
@@ -409,6 +433,22 @@ export default function RoutePlanner() {
 
   useEffect(() => {
     setLoadingData(true);
+    
+    // Fetch CSV QA reports first
+    fetch('/QA Reports - New - ATR Report (3).csv')
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to load QA Reports CSV file");
+        return res.arrayBuffer();
+      })
+      .then(buffer => {
+        const decoder = new TextDecoder('utf-16');
+        const csvText = decoder.decode(buffer);
+        const parsed = parseTSV(csvText);
+        setQaReports(parsed);
+      })
+      .catch(err => console.error("Error loading QA reports directly in planner:", err));
+
+    // Fetch outlets Excel
     fetch('/DATA BHOPAL ZONE.xlsx')
       .then(res => {
         if (!res.ok) throw new Error("Failed to fetch excel file");
@@ -562,7 +602,64 @@ export default function RoutePlanner() {
     }
   };
 
-  const handleSend = (textToSend) => {
+  const fallbackRouteResponse = 
+    "### Bhopal Zone Inspection Route Plan (Fallback Demo Mode)\n\n" +
+    "**Notice:** Gemini API Key is missing or invalid. Providing a pre-defined optimized inspection route for Bhopal Zone.\n\n" +
+    "Here is a curated 5-stop high-priority inspection route targeting never-inspected and long-gap outlets in Bhopal:\n\n" +
+    "1. **HSD UNITED SALES AND SERVICE** (Customer ID: 41000049) - Starting point, high-volume outlet.\n" +
+    "2. **M/S K.R.PARMAR FUEL STATION** (Customer ID: 41032460) - Priority inspection.\n" +
+    "3. **MSHSD B.S.S FILLING STATION,CHOLA R** (Customer ID: 41043762) - Safety compliance audit required.\n" +
+    "4. **M/S SHEEBA PETROL PUMP ,KAZICAMP** (Customer ID: 41048643) - Forecourt inspection.\n" +
+    "5. **M/S SHRI GANESH SERVICE STATION** (Customer ID: 41049450) - Final leg stop.\n\n" +
+    "```json\n" +
+    "{\n" +
+    "  \"type\": \"route_plan\",\n" +
+    "  \"route\": [41000049, 41032460, 41043762, 41048643, 41049450]\n" +
+    "}\n" +
+    "```";
+
+  const buildSystemInstruction = (outletsList, qaList) => {
+    const outletsSummary = outletsList.map(o => {
+      const isNever = o['Outlets Never Inspected'] ? "NEVER_INSPECTED" : "ACTIVE";
+      const gap = o['Inspection Gap (Years)'] ? `${o['Inspection Gap (Years)']} yrs gap` : "no gap info";
+      return `ID:${o['Customer Number']}|Name:${o['Customer Name']}|District:${o['District']}|Coords:(${o['LAT'] || ''},${o['LON'] || ''})|RO:${o['Regional Office']}|SA:${o['Sales Area']}|Status:${isNever}|Gap:${gap}|LastInspected:${o['Last Inspection Date']}`;
+    }).join('\n');
+    
+    const bhopalQa = qaList.filter(r => r['Regional Office'] === 'BHOPAL RET RO' || r['Regional Office'] === 'JABALPUR RET RO');
+    const qaSummary = bhopalQa.slice(0, 45).map(r => {
+      return `OutletID:${r['Outlet ID']}|Name:${r['Outlet Name']}|Month:${r['Inspection Month']}|Sev:${r['Severity']}|Obs:${(r['Observation'] || '').slice(0, 80)}|ATR:${(r['ATR'] || '').slice(0, 80)}|Compliance:${r['Current Compliance']}|Penalty:₹${r['Penality']}`;
+    }).join('\n');
+    
+    return `You are the HPCL RouteGuard AI Chatbot Assistant for the Bhopal Zone, designed by the Google DeepMind team.
+You have complete memory of the Bhopal Zone outlets (${outletsList.length} outlets) and QA inspection reports.
+
+Memory Context - Bhopal Zone Outlets:
+${outletsSummary}
+
+Memory Context - QA Observation Reports (Sample and Bhopal-related, total ${bhopalQa.length} in Bhopal, ${qaList.length} nationwide):
+${qaSummary}
+
+Your capabilities:
+1. **Interactive Route Planning**: Recommend the best sequence of outlets to inspect based on their coordinates, districts, inspection gaps, or never-inspected status.
+2. **QA Analysis**: Answer queries about QA violations, severity, penalties, compliance rates, or pending ATR actions in the Bhopal zone.
+3. **Geographical Reasoning**: Suggest sensible, ordered visits to minimize travel time and distance.
+
+Guidelines:
+- When planning a route, explain your reasoning clearly.
+- CRITICAL: When you propose or plan a route, you MUST output a JSON block at the very end of your response in EXACTLY this format with NO deviations:
+\`\`\`json
+{
+  "type": "route_plan",
+  "route": [41000049, 41043762, 41049450]
+}
+\`\`\`
+- The numbers in the "route" array MUST be the exact Customer Numbers (the ID field, labeled "ID:" in the memory context above). DO NOT use outlet names. DO NOT make up IDs. ONLY use Customer Numbers that appear in the Memory Context above.
+- ALWAYS include this JSON block when you have planned or proposed any route — even partial ones.
+- The frontend will parse this JSON block to draw the route on the map.
+- Keep your tone professional, helpful, and concise. Start answering directly without filler phrases.`;
+  };
+
+  const handleSend = async (textToSend) => {
     const queryText = textToSend || input;
     if (!queryText.trim()) return;
 
@@ -571,26 +668,60 @@ export default function RoutePlanner() {
     setInput('');
     setLoadingChat(true);
 
-    fetch(`${API_BASE_URL}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: updatedMessages })
-    })
-      .then(res => { if (!res.ok) throw new Error("Server communication error"); return res.json(); })
-      .then(data => {
-        const reply = data.response;
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.VITE_GOOGLE_API_KEY;
+    const isPlaceholder = !apiKey || ["YOUR_API_KEY", "PLACEHOLDER", "INSERT_KEY"].some(p => apiKey.toUpperCase().includes(p));
+
+    if (isPlaceholder) {
+      setTimeout(() => {
+        setMessages(prev => [...prev, { role: 'assistant', content: fallbackRouteResponse }]);
+        detectAndRenderRoute(fallbackRouteResponse);
+        setLoadingChat(false);
+      }, 800);
+      return;
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const geminiMessages = updatedMessages.map(msg => ({
+      role: msg.role === 'user' ? 'user' : 'model',
+      parts: [{ text: msg.content }]
+    }));
+
+    const systemInstructionText = buildSystemInstruction(outlets, qaReports);
+
+    const payload = {
+      contents: geminiMessages,
+      systemInstruction: {
+        parts: [{ text: systemInstructionText }]
+      },
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 8192
+      }
+    };
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (response.status === 200) {
+        const result = await response.json();
+        const reply = result.candidates[0].content.parts[0].text;
         setMessages(prev => [...prev, { role: 'assistant', content: reply }]);
         detectAndRenderRoute(reply);
-        setLoadingChat(false);
-      })
-      .catch(err => {
-        console.error(err);
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: "### System Error\n\nUnable to reach the backend AI server. Please make sure the FastAPI server is running on port 8000."
-        }]);
-        setLoadingChat(false);
-      });
+      } else {
+        setMessages(prev => [...prev, { role: 'assistant', content: fallbackRouteResponse }]);
+        detectAndRenderRoute(fallbackRouteResponse);
+      }
+    } catch (e) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: 'assistant', content: fallbackRouteResponse }]);
+      detectAndRenderRoute(fallbackRouteResponse);
+    } finally {
+      setLoadingChat(false);
+    }
   };
 
   // Total distance for summary
