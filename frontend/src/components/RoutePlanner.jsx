@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import * as XLSX from 'xlsx';
 import MapComponent from './MapComponent';
 import {
   Send,
@@ -408,10 +409,49 @@ export default function RoutePlanner() {
 
   useEffect(() => {
     setLoadingData(true);
-    fetch(`${API_BASE_URL}/outlets`)
-      .then(res => res.json())
-      .then(data => { setOutlets(data); setLoadingData(false); })
-      .catch(err => { console.error("Error fetching outlets:", err); setLoadingData(false); });
+    fetch('/DATA BHOPAL ZONE.xlsx')
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to fetch excel file");
+        return res.arrayBuffer();
+      })
+      .then(arrayBuffer => {
+        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        const jsonData = XLSX.utils.sheet_to_json(worksheet);
+        
+        // Clean and format as done in backend/data_loader.py
+        const parsedOutlets = jsonData.map(o => {
+          return {
+            'Customer Number': parseInt(o['Customer Number'], 10) || 0,
+            'Customer Name': String(o['Customer Name'] || '').trim(),
+            'LAT': parseFloat(o['LAT']) || null,
+            'LON': parseFloat(o['LON']) || null,
+            'SBU': String(o['SBU'] || '').trim(),
+            'Zone': String(o['Zone'] || '').trim(),
+            'Regional Office': String(o['Regional Office'] || '').trim(),
+            'Sales Area': String(o['Sales Area'] || '').trim(),
+            'Inspection Gap (Years)': o['Inspection Gap (Years)'] !== undefined ? parseFloat(o['Inspection Gap (Years)']) : null,
+            'Outlets Never Inspected': o['Outlets Never Inspected'] === true || String(o['Outlets Never Inspected']).toLowerCase() === 'true',
+            'District': String(o['District'] || '').trim().toUpperCase(),
+            'Last Inspection Date': o['Last Inspection Date'] ? String(o['Last Inspection Date']).trim() : ''
+          };
+        }).filter(o => o.LAT !== null && o.LON !== null);
+        
+        setOutlets(parsedOutlets);
+        setLoadingData(false);
+      })
+      .catch(err => {
+        console.error("Error reading excel directly in route planner:", err);
+        // Fallback to backend API if fetching local excel fails
+        fetch(`${API_BASE_URL}/outlets`)
+          .then(res => res.json())
+          .then(data => { setOutlets(data); setLoadingData(false); })
+          .catch(apiErr => {
+            console.error("API Fallback failed:", apiErr);
+            setLoadingData(false);
+          });
+      });
   }, []);
 
   // Parse structured route JSON from Gemini response

@@ -32,74 +32,204 @@ export default function Dashboard() {
   const [totalPages, setTotalPages] = useState(1);
   const [totalReports, setTotalReports] = useState(0);
 
-  // Fetch unique regional offices for dropdown
-  useEffect(() => {
-    fetch(`${API_BASE_URL}/qa-reports/regional-offices`)
-      .then(res => res.json())
-      .then(data => setRegionalOffices(data))
-      .catch(err => console.error("Error fetching regional offices:", err));
-  }, []);
+  const [allReports, setAllReports] = useState([]);
 
-  // Fetch stats when RO filter changes
-  const fetchStats = () => {
-    setLoadingStats(true);
-    let url = `${API_BASE_URL}/qa-reports/stats`;
+  // Helper: parse TSV file format (UTF-16 encoding)
+  const parseTSV = (text) => {
+    const lines = text.split(/\r?\n/);
+    if (lines.length === 0) return [];
+    
+    const headers = lines[0].split('\t').map(h => h.trim());
+    const records = [];
+    
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const cols = line.split('\t');
+      const record = {};
+      
+      headers.forEach((h, index) => {
+        let val = cols[index] !== undefined ? cols[index].trim() : '';
+        if (val.startsWith('"') && val.endsWith('"')) {
+          val = val.substring(1, val.length - 1);
+        }
+        record[h] = val;
+      });
+      
+      record['Outlet ID'] = parseInt(record['Outlet ID'], 10) || 0;
+      record['Penality'] = parseFloat(record['Penality']) || 0.0;
+      if (!record['Severity'] || record['Severity'] === 'nan') record['Severity'] = 'Others';
+      if (!record['Original Compilance'] || record['Original Compilance'] === 'nan') record['Original Compilance'] = 'NC';
+      if (!record['Current Compliance'] || record['Current Compliance'] === 'nan') record['Current Compliance'] = 'NC';
+      
+      records.push(record);
+    }
+    return records;
+  };
+
+  // Helper: compute stats locally
+  const computeStats = (reportsList, selectedRo) => {
+    let filtered = reportsList;
     if (selectedRo) {
-      url += `?regional_office=${encodeURIComponent(selectedRo)}`;
+      filtered = filtered.filter(r => r['Regional Office'] === selectedRo);
     }
     
-    fetch(url)
+    const total = filtered.length;
+    if (total === 0) {
+      return {
+        total_reports: 0,
+        severity_counts: {},
+        compliance_counts: { original: {}, current: {} },
+        total_penalties: 0.0,
+        remedial_actions_pending: 0,
+        regional_distribution: {},
+        compliance_rate: 0.0
+      };
+    }
+    
+    const severity_counts = {};
+    const orig_comp = {};
+    const curr_comp = {};
+    let total_penalties = 0.0;
+    let pending_atr = 0;
+    const regional_dist = {};
+    const sales_area_dist = {};
+    
+    filtered.forEach(r => {
+      const sev = String(r['Severity'] || 'Others').trim() || 'Others';
+      severity_counts[sev] = (severity_counts[sev] || 0) + 1;
+      
+      const oc = String(r['Original Compilance'] || 'NC').trim() || 'NC';
+      orig_comp[oc] = (orig_comp[oc] || 0) + 1;
+      
+      const cc = String(r['Current Compliance'] || 'NC').trim() || 'NC';
+      curr_comp[cc] = (curr_comp[cc] || 0) + 1;
+      
+      total_penalties += parseFloat(r['Penality']) || 0.0;
+      
+      const isPendingAtr = (cc === 'NC' || !r['ATR'] || String(r['ATR']).trim() === '' || String(r['ATR']).trim().toLowerCase() === 'nan');
+      if (isPendingAtr) {
+        pending_atr += 1;
+      }
+      
+      const ro = String(r['Regional Office'] || 'Unknown').trim() || 'Unknown';
+      regional_dist[ro] = (regional_dist[ro] || 0) + 1;
+      
+      const sa = String(r['Sales Area'] || 'Unknown').trim() || 'Unknown';
+      sales_area_dist[sa] = (sales_area_dist[sa] || 0) + 1;
+    });
+    
+    const compliantCount = (curr_comp['C'] || 0) + (curr_comp['Compliant'] || 0);
+    const compliance_rate = total > 0 ? parseFloat(((compliantCount / total) * 100).toFixed(2)) : 0.0;
+    
+    return {
+      total_reports: total,
+      severity_counts,
+      compliance_counts: {
+        original: orig_comp,
+        current: curr_comp
+      },
+      total_penalties: parseFloat(total_penalties.toFixed(2)),
+      remedial_actions_pending: pending_atr,
+      regional_distribution: regional_dist,
+      sales_area_distribution: sales_area_dist,
+      compliance_rate
+    };
+  };
+
+  // Helper: filter and paginate reports locally
+  const getFilteredAndPaginatedReports = (reportsList) => {
+    let filtered = reportsList;
+    if (selectedRo) {
+      filtered = filtered.filter(r => r['Regional Office'] === selectedRo);
+    }
+    if (severity) {
+      filtered = filtered.filter(r => r['Severity'] === severity);
+    }
+    if (compliance) {
+      filtered = filtered.filter(r => r['Current Compliance'] === compliance);
+    }
+    if (search) {
+      const searchLower = search.toLowerCase().trim();
+      filtered = filtered.filter(r => 
+        (r['Outlet Name'] || '').toLowerCase().includes(searchLower) ||
+        (r['Observation'] || '').toLowerCase().includes(searchLower) ||
+        String(r['Outlet ID'] || '').includes(searchLower) ||
+        (r['ATR'] || '').toLowerCase().includes(searchLower) ||
+        (r['Remark'] || '').toLowerCase().includes(searchLower)
+      );
+    }
+    
+    const total = filtered.length;
+    const limit = 8;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const startIdx = (page - 1) * limit;
+    const paginated = filtered.slice(startIdx, startIdx + limit);
+    
+    return {
+      data: paginated,
+      total,
+      pages
+    };
+  };
+
+  // Load and parse TSV file directly in React
+  const refreshData = () => {
+    setLoadingStats(true);
+    setLoadingReports(true);
+    setError(null);
+    fetch('/QA Reports - New - ATR Report (3).csv')
       .then(res => {
-        if (!res.ok) throw new Error("Failed to fetch statistics");
-        return res.json();
+        if (!res.ok) throw new Error("Failed to load QA Reports CSV file");
+        return res.arrayBuffer();
       })
-      .then(data => {
-        setStats(data);
-        setLoadingStats(false);
+      .then(buffer => {
+        const decoder = new TextDecoder('utf-16');
+        const csvText = decoder.decode(buffer);
+        const parsed = parseTSV(csvText);
+        setAllReports(parsed);
+        
+        // Populate regional offices
+        const offices = [...new Set(parsed.map(r => r['Regional Office']).filter(Boolean))].sort();
+        setRegionalOffices(offices);
       })
       .catch(err => {
         console.error(err);
-        setError("Error loading dashboard metrics");
+        setError("Error loading Excel/CSV data directly in browser");
         setLoadingStats(false);
+        setLoadingReports(false);
       });
   };
 
-  // Fetch paginated reports
+  useEffect(() => {
+    refreshData();
+  }, []);
+
+  const fetchStats = () => {
+    if (allReports.length === 0) return;
+    setLoadingStats(true);
+    const calculatedStats = computeStats(allReports, selectedRo);
+    setStats(calculatedStats);
+    setLoadingStats(false);
+  };
+
   const fetchReports = () => {
+    if (allReports.length === 0) return;
     setLoadingReports(true);
-    let queryParams = [`page=${page}`, `limit=8`];
-    if (search) queryParams.push(`search=${encodeURIComponent(search)}`);
-    if (severity) queryParams.push(`severity=${encodeURIComponent(severity)}`);
-    if (compliance) queryParams.push(`compliance=${encodeURIComponent(compliance)}`);
-    if (selectedRo) queryParams.push(`regional_office=${encodeURIComponent(selectedRo)}`);
-    
-    const url = `${API_BASE_URL}/qa-reports?${queryParams.join('&')}`;
-    
-    fetch(url)
-      .then(res => {
-        if (!res.ok) throw new Error("Failed to fetch reports");
-        return res.json();
-      })
-      .then(data => {
-        setReports(data.data);
-        setTotalPages(data.pages);
-        setTotalReports(data.total);
-        setLoadingReports(false);
-      })
-      .catch(err => {
-        console.error(err);
-        setError("Error loading QA observations");
-        setLoadingReports(false);
-      });
+    const filteredResults = getFilteredAndPaginatedReports(allReports);
+    setReports(filteredResults.data);
+    setTotalPages(filteredResults.pages);
+    setTotalReports(filteredResults.total);
+    setLoadingReports(false);
   };
 
   useEffect(() => {
     fetchStats();
-  }, [selectedRo]);
+  }, [allReports, selectedRo]);
 
   useEffect(() => {
     fetchReports();
-  }, [page, search, severity, compliance, selectedRo]);
+  }, [allReports, page, search, severity, compliance, selectedRo]);
 
   // Reset page when filters change
   const handleFilterChange = (filterType, value) => {
@@ -376,7 +506,7 @@ export default function Dashboard() {
           </select>
           <button 
             className="pagination-btn"
-            onClick={() => { fetchStats(); fetchReports(); }}
+            onClick={() => { refreshData(); }}
             style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}
           >
             <RefreshCw size={14} /> Refresh
